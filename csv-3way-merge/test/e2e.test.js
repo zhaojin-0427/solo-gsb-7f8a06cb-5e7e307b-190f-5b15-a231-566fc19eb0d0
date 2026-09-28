@@ -17,6 +17,16 @@ const {
   validateDeterminantParams,
   buildDeterminants,
 } = require('../src/determinants');
+const {
+  ALLOCATION_COLUMN,
+  validateAllocationParams,
+  hasAllocationColumn,
+  parseAmount,
+  formatUnits,
+  formatCents,
+  buildAllocation,
+  buildAllocationRows,
+} = require('../src/allocation');
 
 let passed = 0;
 function test(name, fn) {
@@ -1435,6 +1445,175 @@ test('发现：最终行序与逐格取值和导出一致（读裁决后的最�
   const ce = out.result.counterexample;
   assert.strictEqual(ce.row1.key, 'K1');
   assert.strictEqual(ce.row2.key, 'K2');
+});
+
+// ---------- 合并金额尾差分摊 ----------
+test('分摊：参数校验（两列必须给出、在表头中且互异；唯一键列可参与）', () => {
+  const csv = 'id,g,a\nK1,x,1';
+  const m = buildMerge(parse3(csv, csv, csv), 'id');
+  assert.strictEqual(validateAllocationParams(m, 'g', 'a'), null);
+  assert.strictEqual(validateAllocationParams(m, 'id', 'a'), null); // 唯一键列可作分组列
+  assert.strictEqual(validateAllocationParams(m, 'g', 'id'), null); // 唯一键列可作金额列
+  assert.ok(validateAllocationParams(m, '', 'a').includes('缺少 groupColumn'));
+  assert.ok(validateAllocationParams(m, 'g', '').includes('缺少 amountColumn'));
+  assert.ok(validateAllocationParams(m, 'nope', 'a').includes('不在表头'));
+  assert.ok(validateAllocationParams(m, 'g', 'nope').includes('不在表头'));
+  assert.ok(validateAllocationParams(m, 'g', 'g').includes('不同'));
+  assert.strictEqual(hasAllocationColumn(m), false);
+  const m2 = buildMerge(parse3('id,分摊金额\nK1,1', 'id,分摊金额\nK1,1', 'id,分摊金额\nK1,1'), 'id');
+  assert.strictEqual(hasAllocationColumn(m2), true);
+  assert.strictEqual(ALLOCATION_COLUMN, '分摊金额');
+});
+
+test('分摊：金额解析（非负、无指数、最多四位小数；空串单独识别）', () => {
+  const ok = ['0', '12', '12.3', '0.005', '100.0000', '01', '123456789012345678'];
+  for (const s of ok) assert.strictEqual(parseAmount(s).ok, true, s);
+  const bad = ['', ' ', '-1', '+1', '1e3', '1.', '.5', '1.23456', 'NaN', 'abc', '１', '1.0.0',
+    '0x10', '1234567890123456789'];
+  for (const s of bad) {
+    const r = parseAmount(s);
+    assert.strictEqual(r.ok, false, s);
+    if (s === '') assert.strictEqual(r.reason, 'empty');
+    else assert.strictEqual(r.reason, 'invalid');
+  }
+  // 单位为 1/10000 元
+  assert.strictEqual(parseAmount('12.5').units, 125000n);
+  assert.strictEqual(parseAmount('0.0001').units, 1n);
+  assert.strictEqual(formatUnits(300070n), '30.007');
+  assert.strictEqual(formatUnits(50000n), '5');
+  assert.strictEqual(formatCents(3001n), '30.01');
+  assert.strictEqual(formatCents(0n), '0.00');
+});
+
+test('分摊：组精确求和四舍五入到分，差额按余数降序、同余数按最终行序逐分分配', () => {
+  // x 组：10.003（余30）+ 20.004（余40）= 30.007 → 30.01；floor 合计 30.00，补 1 分给余 40 的 K2
+  const csv = 'id,g,a\nK1,x,10.003\nK2,x,20.004\nK3,y,0';
+  const m = buildMerge(parse3(csv, csv, csv), 'id');
+  const out = buildAllocation(m, {}, 'g', 'a');
+  assert.strictEqual(out.unresolved, 0);
+  assert.strictEqual(out.amountErrors, undefined);
+  const [gx, gy] = out.result.groups;
+  assert.strictEqual(gx.groupValue, 'x');
+  assert.strictEqual(gx.sumExact, '30.007');
+  assert.strictEqual(gx.totalRounded, '30.01');
+  assert.strictEqual(gx.floorTotal, '30.00');
+  assert.strictEqual(gx.diffCents, 1);
+  assert.deepStrictEqual(gx.rows.map((r) => [r.key, r.floorAmount, r.allocated, r.extraCent]), [
+    ['K1', '10.00', '10.00', false],
+    ['K2', '20.00', '20.01', true],
+  ]);
+  // y 组（0 元）：无尾差
+  assert.strictEqual(gy.totalRounded, '0.00');
+  assert.strictEqual(gy.diffCents, 0);
+  assert.strictEqual(gy.rows[0].allocated, '0.00');
+});
+
+test('分摊：同余数时最终行序在前者补分；每组分摊额合计等于组四舍五入总额', () => {
+  // K1/K2 同为 0.004（余40 并列），K3 为 0.003（余30）：组和 0.011 → 0.01；
+  // floor 合计 0，补 1 分时余数并列的 K1/K2 中按最终行序取最早的 K1
+  const csv = 'id,g,a\nK1,x,0.004\nK2,x,0.004\nK3,x,0.003';
+  const m = buildMerge(parse3(csv, csv, csv), 'id');
+  const g = buildAllocation(m, {}, 'g', 'a').result.groups[0];
+  assert.strictEqual(g.totalRounded, '0.01');
+  assert.strictEqual(g.diffCents, 1);
+  assert.strictEqual(g.rows[0].extraCent, true); // K1
+  assert.strictEqual(g.rows[1].extraCent, false); // K2：同余数但行序更晚
+  assert.strictEqual(g.rows[2].extraCent, false); // K3：余数更小
+  assert.strictEqual(g.rows[0].allocated, '0.01');
+  // 校验：分摊额合计（分）= totalRounded（分）
+  const sum = g.rows.reduce((acc, r) => acc + BigInt(Math.round(Number(r.allocated) * 100)), 0n);
+  assert.strictEqual(sum, 1n);
+});
+
+test('分摊：大尾差（99 分）逐分分配，每行至多补 1 分，且无超发', () => {
+  // 100 行 0.0099：组和 0.9900 → 99 分，floor 合计 0 → 前 99 行各 +0.01，最后一行 0.00
+  const lines = ['id,g,a'];
+  for (let i = 1; i <= 100; i++) lines.push(`R${String(i).padStart(3, '0')},x,0.0099`);
+  const csv = lines.join('\n');
+  const m = buildMerge(parse3(csv, csv, csv), 'id');
+  const g = buildAllocation(m, {}, 'g', 'a').result.groups[0];
+  assert.strictEqual(g.diffCents, 99);
+  assert.strictEqual(g.rows.filter((r) => r.extraCent).length, 99);
+  assert.strictEqual(g.rows[99].allocated, '0.00');
+  const cents = g.rows.reduce((acc, r) => acc + BigInt(Math.round(Number(r.allocated) * 100)), 0n);
+  assert.strictEqual(cents, 99n);
+});
+
+test('分摊：空串也可成组；组按首次出现顺序，行附最终 CSV 行号', () => {
+  const csv = 'id,g,a\nK1,,1\nK2,x,2\nK3,,3';
+  const m = buildMerge(parse3(csv, csv, csv), 'id');
+  const out = buildAllocation(m, {}, 'g', 'a').result;
+  assert.deepStrictEqual(out.groups.map((g) => g.groupValue), ['', 'x']);
+  const empty = out.groups[0];
+  assert.strictEqual(empty.rowCount, 2);
+  assert.strictEqual(empty.sumExact, '4');
+  assert.deepStrictEqual(empty.rows.map((r) => r.line), [2, 4]); // 表头第 1 行
+});
+
+test('分摊：空值与非法金额指出最终 CSV 行号并拒绝整次计算（不给任何组）', () => {
+  const csv =
+    'id,g,a\n' +
+    'K1,x,1.00\n' + // 第 2 行：合法
+    'K2,x,\n' + // 第 3 行：空值
+    'K3,y,1e3\n' + // 第 4 行：指数
+    'K4,y,-2\n' + // 第 5 行：负数
+    'K5,y,1.23456\n' + // 第 6 行：超过四位小数
+    'K6,y,3.3'; // 第 7 行：合法
+  const m = buildMerge(parse3(csv, csv, csv), 'id');
+  const out = buildAllocation(m, {}, 'g', 'a');
+  assert.strictEqual(out.result, undefined);
+  assert.strictEqual(out.amountErrors.length, 4);
+  assert.deepStrictEqual(out.amountErrors.map((e) => [e.line, e.kind]), [
+    [3, 'empty'],
+    [4, 'invalid'],
+    [5, 'invalid'],
+    [6, 'invalid'],
+  ]);
+  assert.ok(out.amountErrors[0].message.includes('第 3 行'));
+  assert.ok(out.amountErrors[0].message.includes('为空'));
+  assert.ok(out.amountErrors[1].message.includes('1e3'));
+  assert.ok(out.amountErrors[1].message.includes('指数'));
+});
+
+test('分摊：有未决冲突时不给结论；裁决后按最终保留行（删除行不参与）', () => {
+  // T 的分组列 g 本地 / 远端改成不同值 → 单元格冲突未决
+  const p = parse3('id,g,a\nT,x,1', 'id,g,a\nT,l,1', 'id,g,a\nT,r,1');
+  const m = buildMerge(p, 'id');
+  let out = buildAllocation(m, {}, 'g', 'a');
+  assert.ok(out.unresolved > 0);
+  assert.strictEqual(out.result, undefined);
+  // 裁决取本地
+  out = buildAllocation(m, { cells: { T: { 1: { choice: 'local' } } } }, 'g', 'a');
+  assert.strictEqual(out.unresolved, 0);
+  assert.strictEqual(out.result.groups[0].groupValue, 'l');
+
+  // D 两侧删除：不出现在最终行；保留 K 独立成组
+  const p2 = parse3('id,g,a\nK,x,1\nD,y,2', 'id,g,a\nK,x,1', 'id,g,a\nK,x,1');
+  const m2 = buildMerge(p2, 'id');
+  const out2 = buildAllocation(m2, {}, 'g', 'a').result;
+  assert.strictEqual(out2.rowCount, 1);
+  assert.strictEqual(out2.groupCount, 1);
+  assert.strictEqual(out2.groups[0].rows[0].key, 'K');
+});
+
+test('分摊：无保留行时返回空结果；导出只输出新表头', () => {
+  const m = buildMerge(parse3('id,g,a\nK,x,1', 'id,g,a', 'id,g,a'), 'id');
+  const out = buildAllocation(m, {}, 'g', 'a');
+  assert.strictEqual(out.result.rowCount, 0);
+  assert.deepStrictEqual(out.result.groups, []);
+  const rows = buildAllocationRows(m, out.result, []);
+  assert.deepStrictEqual(rows, [['id', 'g', 'a', '分摊金额']]);
+});
+
+test('分摊：导出行按原行序追加「分摊金额」列，逐格值与合并导出一致', () => {
+  const csv = 'id,g,a\nK1,x,10.003\nK2,x,20.004';
+  const m = buildMerge(parse3(csv, csv, csv), 'id');
+  const out = buildAllocation(m, {}, 'g', 'a').result;
+  const finalCells = resolveAll(m, {}).rows;
+  const rows = buildAllocationRows(m, out, finalCells);
+  assert.deepStrictEqual(rows[0], ['id', 'g', 'a', '分摊金额']);
+  assert.deepStrictEqual(rows[1], ['K1', 'x', '10.003', '10.00']);
+  assert.deepStrictEqual(rows[2], ['K2', 'x', '20.004', '20.01']);
 });
 
 console.log(`\n全部 ${passed} 个测试通过`);

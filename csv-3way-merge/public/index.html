@@ -393,6 +393,55 @@
         <p class="det-disclaimer" id="det-disclaimer"></p>
       </div>
     </section>
+
+    <!-- 第九步：合并金额尾差分摊 -->
+    <section id="step-allocation" class="card hidden">
+      <h2><span class="step-no">9</span> 合并金额尾差分摊</h2>
+      <p class="ledger-intro">
+        冲突全部裁决后，在这里选择两个<b>互异</b>的列：<b>分组列</b>与<b>金额列</b>。
+        分组按分组列<b>原字符串</b>精确匹配（不裁剪空白，<b>空串也可成组</b>）；
+        金额以<b>元</b>计，只接受<b>非负、无指数、最多四位小数</b>的十进制字符串——
+        <b>空值或非法值会指出最终 CSV 行号并拒绝整次计算</b>。服务端对各组精确求和后
+        <b>四舍五入到分</b>，每行金额先<b>向下取整到分</b>，再把差额按原金额不足一分的
+        <b>余数降序</b>、同余数按<b>最终行序</b>逐分分配（每行至多补 1 分）。
+        下方展示每组总额与逐行分摊额；可下载按原行序追加「分摊金额」列的 CSV
+        （原表头已有同名列时明确报错；无行时只输出新表头）。
+        裁决或选列变化后自动重算，不改变任何数据、裁决与原合并 CSV。
+      </p>
+
+      <div class="toolbar">
+        <div class="alloc-controls">
+          <div class="key-row">
+            <label for="alloc-group-select">分组列：</label>
+            <select id="alloc-group-select"></select>
+          </div>
+          <div class="key-row">
+            <label for="alloc-amount-select">金额列：</label>
+            <select id="alloc-amount-select"></select>
+          </div>
+          <div class="alloc-hint">金额只接受非负、无指数、最多四位小数的十进制数字（如 12、12.3、0.005）。</div>
+        </div>
+        <div class="export-area">
+          <button id="btn-allocation" class="primary" disabled>下载分摊 CSV</button>
+        </div>
+      </div>
+
+      <div id="alloc-hint" class="hierarchy-hint hidden">
+        请选择两个互异的列（分组列与金额列不能相同）后开始尾差分摊。
+      </div>
+      <div id="alloc-pending" class="ledger-pending hidden">
+        还有未解决的冲突：全部裁决完成后才会进行金额尾差分摊。
+      </div>
+      <div id="alloc-errors" class="errors hidden"></div>
+
+      <div id="alloc-content" class="hidden">
+        <div id="alloc-summary" class="ledger-summary"></div>
+        <div id="alloc-nodata" class="hierarchy-hint hidden">
+          当前没有最终保留行（数据为空或全部被删除）：分摊 CSV 将只包含追加「分摊金额」列后的新表头。
+        </div>
+        <div id="alloc-groups"></div>
+      </div>
+    </section>
   </main>
 
   <footer>

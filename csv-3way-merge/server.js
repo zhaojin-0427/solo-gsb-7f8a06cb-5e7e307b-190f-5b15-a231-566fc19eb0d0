@@ -13,6 +13,13 @@ const { buildImportOrder } = require('./src/order');
 const { buildPlan, validatePlanStructure, applyPlan, cloneDecisions } = require('./src/plan');
 const { buildKeyChangeCheck, validateKeyCheckParams } = require('./src/keychange');
 const { buildDeterminants, validateDeterminantParams } = require('./src/determinants');
+const {
+  ALLOCATION_COLUMN,
+  validateAllocationParams,
+  hasAllocationColumn,
+  buildAllocation,
+  buildAllocationRows,
+} = require('./src/allocation');
 const { RoundStore } = require('./src/rounds');
 
 const app = express();
@@ -691,6 +698,126 @@ app.post('/api/determinants', (req, res) => {
     }
 
     res.json({ ok: true, roundId, result: result.result });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({
+      ok: false,
+      stage: 'server',
+      errors: [{ file: null, line: null, message: err.message }],
+    });
+  }
+});
+
+/**
+ * 合并金额尾差分摊的前置校验：
+ *  - 原表头已含 "分摊金额" 追加列时，无论选列如何都明确报错（400，不做覆盖）；
+ *  - 分组列 / 金额列缺失、不在表头或两列相同时返回 400。
+ * 通过时返回 null；不通过时写入响应并返回 true。
+ */
+function allocationPrecheck(res, model, groupColumn, amountColumn) {
+  if (hasAllocationColumn(model)) {
+    res.status(400).json({
+      ok: false,
+      stage: 'request',
+      errors: [
+        {
+          file: null,
+          line: 1,
+          message:
+            `原表头已存在 "${ALLOCATION_COLUMN}" 列：追加分摊金额列会与之冲突，` +
+            '请先在源数据中改名或删除该列后重新上传',
+        },
+      ],
+    });
+    return true;
+  }
+  const paramError = validateAllocationParams(model, groupColumn, amountColumn);
+  if (paramError) {
+    res.status(400).json({
+      ok: false,
+      stage: 'request',
+      errors: [{ file: null, line: null, message: paramError }],
+    });
+    return true;
+  }
+  return false;
+}
+
+/**
+ * 金额空值 / 非法值：按最终 CSV 行号逐项指出并拒绝整次计算（409 stage=amount）。
+ */
+function amountErrorsResponse(res, amountErrors) {
+  return res.status(409).json({
+    ok: false,
+    stage: 'amount',
+    errorCount: amountErrors.length,
+    errors: amountErrors.map((e) => ({ file: null, line: e.line, message: e.message })),
+  });
+}
+
+/**
+ * POST /api/allocation
+ * body: { roundId, decisions, groupColumn, amountColumn }
+ * 合并金额尾差分摊：冲突全部裁决后，从本轮模型与裁决取得最终保留行，按分组列原
+ * 字符串分组（空串也可成组），金额以元计、只接受非负无指数最多四位小数的十进制
+ * 字符串；空值或非法值指出最终 CSV 行号并拒绝整次计算。各组精确求和后四舍五入
+ * 到分，每行先向下取整到分，再把差额按不足一分的余数降序、同余数按最终行序逐分
+ * 分配。返回每组总额（精确值 / 四舍五入值）与逐行分摊额供页面展示。
+ * 只读：不改动模型、数据、裁决与原合并 CSV；有未决冲突时返回 409。
+ * 服务端只从本轮模型和裁决取数，请求体夹带的任何行数据都会被忽略。
+ */
+app.post('/api/allocation', (req, res) => {
+  try {
+    const { roundId, decisions, groupColumn, amountColumn } = req.body || {};
+    const round = roundStore.get(roundId);
+    if (!round) return roundNotFound(res);
+    const { model } = round;
+    if (!requireModel(res, model)) return;
+    if (allocationPrecheck(res, model, groupColumn, amountColumn)) return;
+
+    const result = buildAllocation(model, normalizeDecisions(decisions), groupColumn, amountColumn);
+    if (result.unresolved > 0) return unresolvedResponse(res, result);
+    if (result.amountErrors) return amountErrorsResponse(res, result.amountErrors);
+
+    res.json({ ok: true, roundId, allocation: result.result });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({
+      ok: false,
+      stage: 'server',
+      errors: [{ file: null, line: null, message: err.message }],
+    });
+  }
+});
+
+/**
+ * POST /api/allocation/export
+ * body 同 /api/allocation；返回按原行序追加 "分摊金额" 列的 CSV
+ * （沿用基准表头与原单元格值，UTF-8 带 BOM；无保留行时只输出新表头）。
+ * 原表头已有同名列、金额空值 / 非法值、未决冲突时分别以 400 / 409 拒绝；
+ * 原合并 CSV（/api/export 的 merged.csv）内容始终不变。
+ */
+app.post('/api/allocation/export', (req, res) => {
+  try {
+    const { roundId, decisions, groupColumn, amountColumn } = req.body || {};
+    const round = roundStore.get(roundId);
+    if (!round) return roundNotFound(res);
+    const { model } = round;
+    if (!requireModel(res, model)) return;
+    if (allocationPrecheck(res, model, groupColumn, amountColumn)) return;
+
+    const normalized = normalizeDecisions(decisions);
+    const result = buildAllocation(model, normalized, groupColumn, amountColumn);
+    if (result.unresolved > 0) return unresolvedResponse(res, result);
+    if (result.amountErrors) return amountErrorsResponse(res, result.amountErrors);
+
+    // 与 /api/export 同源的最终行（resolveAll 与分摊共用 resolveRowProvenance）
+    const resolved = resolveAll(model, normalized);
+    const rows = buildAllocationRows(model, result.result, resolved.rows);
+    const csv = String.fromCharCode(0xfeff) + stringifyCSV(rows);
+    res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+    res.setHeader('Content-Disposition', 'attachment; filename="allocation.csv"');
+    res.send(csv);
   } catch (err) {
     console.error(err);
     res.status(500).json({

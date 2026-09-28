@@ -527,6 +527,21 @@ tr.row-conflict { background: var(--conflict-bg); }
 }
 #det-counter-table { margin-top: 8px; }
 
+/* 合并金额尾差分摊 */
+.alloc-controls { display: flex; flex-direction: column; gap: 8px; }
+.alloc-hint { font-size: 12px; color: var(--muted); }
+#alloc-groups { display: flex; flex-direction: column; gap: 18px; margin-top: 12px; }
+.alloc-group { border: 1px solid var(--border); border-radius: 10px; padding: 12px 14px; background: #fcfcfd; }
+.alloc-group-title { margin: 0 0 8px; font-size: 14px; }
+.alloc-table td, .alloc-table th { padding: 6px 10px; font-size: 13px; }
+.alloc-table tr.alloc-extra { background: var(--ok-bg); }
+.alloc-bump {
+  color: var(--ok);
+  font-weight: 700;
+  font-size: 12px;
+  white-space: nowrap;
+}
+
 footer {
   text-align: center;
   color: var(--muted);

@@ -31,6 +31,8 @@
     keyCheckMaxDiff: 0, // 差异上限（0 至比较列数的整数）
     detTarget: '', // 最小决定列发现选中的非键目标列（空 = 未选择）
     detCandidates: [], // 最小决定列发现选中的互异候选列（1～10 个）
+    allocGroup: '', // 金额尾差分摊选中的分组列（空 = 未选择）
+    allocAmount: '', // 金额尾差分摊选中的金额列（空 = 未选择）
   };
 
   // ---------- 工具 ----------
@@ -207,6 +209,7 @@
     resetOrder();
     resetKeycheck();
     resetDeterminants();
+    resetAllocation();
     const sel = $('#key-select');
     sel.innerHTML = keyColumns.map((h) => `<option value="${esc(h)}">${esc(h)}</option>`).join('');
     // 默认猜测：名为 id / key / 编号 等
@@ -268,6 +271,7 @@
     resetOrder();
     resetKeycheck();
     resetDeterminants();
+    resetAllocation();
     $('#step-key').classList.add('hidden');
     $('#step-result').classList.add('hidden');
     $('#step-upload').scrollIntoView({ behavior: 'smooth', block: 'start' });
@@ -282,6 +286,7 @@
     setupHierarchy();
     setupKeycheck();
     setupDeterminants();
+    setupAllocation();
     updateResolutionState();
     $('#step-result').scrollIntoView({ behavior: 'smooth', block: 'start' });
   }
@@ -591,6 +596,8 @@
     refreshKeycheck(count);
     // 以及最小决定列发现（未选目标列 / 候选列时只提示选择）
     refreshDeterminants(count);
+    // 以及合并金额尾差分摊（未选分组列 / 金额列时只提示选择）
+    refreshAllocation(count);
   }
 
   // ---------- 来源账本 ----------
@@ -1647,6 +1654,243 @@
       showErrors(errEl, [{ file: null, line: null, message: `发现结果下载失败：${e.message}` }]);
     } finally {
       btn.disabled = $('#det-content').classList.contains('hidden');
+    }
+  });
+
+  // ---------- 合并金额尾差分摊 ----------
+  // 分摊完全由服务端按本轮模型与当前裁决计算（只读，不改变任何数据、裁决与原合并
+  // CSV）；前端只负责选择分组列 / 金额列、展示每组总额与逐行分摊额、下载追加列 CSV
+  let allocTimer = null; // 防抖
+  let allocSeq = 0; // 丢弃过期的响应
+
+  function resetAllocation() {
+    clearTimeout(allocTimer);
+    allocSeq++;
+    state.allocGroup = '';
+    state.allocAmount = '';
+    $('#step-allocation').classList.add('hidden');
+    $('#alloc-content').classList.add('hidden');
+    $('#alloc-pending').classList.add('hidden');
+    $('#alloc-errors').classList.add('hidden');
+    $('#alloc-hint').classList.add('hidden');
+    $('#alloc-groups').innerHTML = '';
+    $('#btn-allocation').disabled = true;
+  }
+
+  function hideAllocResult() {
+    $('#alloc-content').classList.add('hidden');
+    $('#alloc-errors').classList.add('hidden');
+    $('#btn-allocation').disabled = true;
+  }
+
+  // 每次合并成功后重建分组列 / 金额列下拉框（可选任意表头列，含唯一键列），
+  // 默认不选择；旧结论一并清除
+  function setupAllocation() {
+    const m = state.model;
+    clearTimeout(allocTimer);
+    allocSeq++;
+    state.allocGroup = '';
+    state.allocAmount = '';
+    const options =
+      `<option value="">（请选择）</option>` +
+      m.headers.map((h) => `<option value="${esc(h)}">${esc(h)}</option>`).join('');
+    $('#alloc-group-select').innerHTML = options;
+    $('#alloc-amount-select').innerHTML = options;
+    hideAllocResult();
+    $('#alloc-pending').classList.add('hidden');
+    $('#alloc-hint').classList.add('hidden');
+  }
+
+  // 选列变化：记录选择后自动重算（两列相同或任一未选时只提示，不发请求）
+  $('#alloc-group-select').addEventListener('change', () => {
+    state.allocGroup = $('#alloc-group-select').value;
+    refreshAllocation(computeUnresolved().count);
+  });
+  $('#alloc-amount-select').addEventListener('change', () => {
+    state.allocAmount = $('#alloc-amount-select').value;
+    refreshAllocation(computeUnresolved().count);
+  });
+
+  /**
+   * 裁决或选列变化后调用：全部解决、且已选两个互异列才向服务端请求分摊（防抖）；
+   * 有未决冲突或选列不完整时收起旧结论，避免展示过时结果。
+   */
+  function refreshAllocation(unresolvedCount) {
+    if (!state.model) {
+      resetAllocation();
+      return;
+    }
+    $('#step-allocation').classList.remove('hidden');
+    const ready =
+      state.allocGroup && state.allocAmount && state.allocGroup !== state.allocAmount;
+    if (!ready) {
+      clearTimeout(allocTimer);
+      allocSeq++;
+      hideAllocResult();
+      $('#alloc-pending').classList.add('hidden');
+      $('#alloc-hint').classList.remove('hidden');
+      $('#alloc-hint').textContent =
+        !state.allocGroup || !state.allocAmount
+          ? '请选择分组列与金额列后开始尾差分摊。'
+          : '分组列与金额列必须是不同的列，请重新选择。';
+      return;
+    }
+    $('#alloc-hint').classList.add('hidden');
+    if (unresolvedCount > 0) {
+      clearTimeout(allocTimer);
+      allocSeq++;
+      hideAllocResult();
+      $('#alloc-pending').classList.remove('hidden');
+      return;
+    }
+    $('#alloc-pending').classList.add('hidden');
+    clearTimeout(allocTimer);
+    allocTimer = setTimeout(loadAllocation, 250);
+  }
+
+  async function requestAllocation() {
+    const { status, data } = await postJSON('/api/allocation', {
+      roundId: state.roundId,
+      decisions: state.decisions,
+      groupColumn: state.allocGroup,
+      amountColumn: state.allocAmount,
+    });
+    if (data.ok) return { status, allocation: data.allocation };
+    if (status === 404 && data.stage === 'round') {
+      showErrors($('#upload-errors'), data.errors || []);
+      handleRoundExpired();
+      return { status, allocation: null };
+    }
+    if (status === 409 && data.stage === 'unresolved') {
+      // 服务端判定仍有未决冲突：不给出结论，回到待解决提示
+      hideAllocResult();
+      $('#alloc-pending').classList.remove('hidden');
+      return { status, allocation: null };
+    }
+    if (status === 409 && data.stage === 'amount') {
+      // 金额空值 / 非法值：按最终 CSV 行号指出并拒绝整次计算
+      hideAllocResult();
+      showErrors(
+        $('#alloc-errors'),
+        data.errors || [{ file: null, line: null, message: '金额列存在无法分摊的值' }],
+      );
+      return { status, allocation: null };
+    }
+    // 400：原表头已有 "分摊金额" 列、选列缺失 / 不在表头 / 两列相同等
+    hideAllocResult();
+    showErrors(
+      $('#alloc-errors'),
+      data.errors || [{ file: null, line: null, message: '金额尾差分摊失败' }],
+    );
+    return { status, allocation: null };
+  }
+
+  async function loadAllocation() {
+    const seq = ++allocSeq;
+    const { allocation } = await requestAllocation();
+    if (!allocation || seq !== allocSeq) return;
+    $('#alloc-errors').classList.add('hidden');
+    renderAllocation(allocation);
+    $('#alloc-content').classList.remove('hidden');
+    $('#btn-allocation').disabled = false;
+  }
+
+  function renderAllocation(alloc) {
+    $('#alloc-summary').innerHTML =
+      `<span class="stat">分组列 <b>${esc(alloc.groupColumn)}</b></span>` +
+      `<span class="stat">金额列 <b>${esc(alloc.amountColumn)}</b></span>` +
+      `<span class="stat">分摊行数 <b>${alloc.rowCount}</b></span>` +
+      `<span class="stat">组数 <b>${alloc.groupCount}</b></span>`;
+
+    $('#alloc-nodata').classList.toggle('hidden', alloc.rowCount > 0);
+
+    $('#alloc-groups').innerHTML = alloc.groups
+      .map((g, gi) => {
+        const head =
+          g.groupValue === ''
+            ? '<span class="lg-empty">（空串分组）</span>'
+            : esc(g.groupValue);
+        const rows = g.rows
+          .map(
+            (r) =>
+              `<tr${r.extraCent ? ' class="alloc-extra"' : ''}>` +
+              `<td>第 ${r.line} 行</td>` +
+              `<td class="key-cell">${esc(r.key)}</td>` +
+              `<td>${esc(r.amount)}</td>` +
+              `<td>${esc(r.floorAmount)}</td>` +
+              `<td>${esc(r.remainderText)}</td>` +
+              `<td>${r.extraCent ? '<span class="alloc-bump">+0.01</span>' : '—'}</td>` +
+              `<td><b>${esc(r.allocated)}</b></td>` +
+              `</tr>`,
+          )
+          .join('');
+        return (
+          `<div class="alloc-group">` +
+          `<h3 class="alloc-group-title">组 ${gi + 1}：分组值 ${head}</h3>` +
+          `<div class="ledger-summary">` +
+          `<span class="stat">行数 <b>${g.rowCount}</b></span>` +
+          `<span class="stat">精确求和 <b>${esc(g.sumExact)}</b></span>` +
+          `<span class="stat">四舍五入到分 <b>${esc(g.totalRounded)}</b></span>` +
+          `<span class="stat">逐行取整合计 <b>${esc(g.floorTotal)}</b></span>` +
+          `<span class="stat ${g.diffCents > 0 ? 'conflict' : ''}">尾差 <b>${g.diffCents}</b> 分</span>` +
+          `</div>` +
+          `<div class="table-wrap"><table class="alloc-table">` +
+          `<thead><tr><th>最终 CSV 行号</th><th>唯一键</th><th>原金额（元）</th>` +
+          `<th>向下取整（分）</th><th>不足一分余数</th><th>尾差补充分</th><th>分摊金额（元）</th></tr></thead>` +
+          `<tbody>${rows}</tbody></table></div>` +
+          `</div>`
+        );
+      })
+      .join('');
+  }
+
+  // 下载分摊 CSV：服务端按当前裁决与选列实时重算并追加「分摊金额」列
+  $('#btn-allocation').addEventListener('click', async () => {
+    const errEl = $('#alloc-errors');
+    const btn = $('#btn-allocation');
+    btn.disabled = true;
+    try {
+      const resp = await fetch('/api/allocation/export', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          roundId: state.roundId,
+          decisions: state.decisions,
+          groupColumn: state.allocGroup,
+          amountColumn: state.allocAmount,
+        }),
+      });
+      if (!resp.ok) {
+        const data = await resp.json().catch(() => ({ errors: [] }));
+        if (resp.status === 404 && data.stage === 'round') {
+          showErrors($('#upload-errors'), data.errors || []);
+          handleRoundExpired();
+          return;
+        }
+        if (resp.status === 409 && data.stage === 'unresolved') {
+          $('#alloc-content').classList.add('hidden');
+          $('#alloc-pending').classList.remove('hidden');
+          return;
+        }
+        showErrors(errEl, data.errors || [{ file: null, line: null, message: '分摊 CSV 导出被拒绝' }]);
+        // 金额错误等 409：刷新页面展示最新结论（错误已在上方列出）
+        if (resp.status === 409 && data.stage === 'amount') hideAllocResult();
+        return;
+      }
+      errEl.classList.add('hidden');
+      const blob = await resp.blob();
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = 'allocation.csv';
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      URL.revokeObjectURL(url);
+    } catch (e) {
+      showErrors(errEl, [{ file: null, line: null, message: `分摊 CSV 导出失败：${e.message}` }]);
+    } finally {
+      btn.disabled = $('#alloc-content').classList.contains('hidden');
     }
   });
 

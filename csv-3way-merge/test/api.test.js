@@ -1304,6 +1304,274 @@ const SMALL = {
       assert.ok(r.json().errors[0].message.includes('300'));
     });
 
+    // ---------- 合并金额尾差分摊 ----------
+    const ALLOC = {
+      base: {
+        filename: 'base.csv',
+        content:
+          'id,g,a\n' +
+          'K1,x,10.003\n' +
+          'K2,x,20.004\n' +
+          'K3,y,5.000\n' +
+          'K4,,0.001',
+      },
+      local: {
+        filename: 'local.csv',
+        content:
+          'id,g,a\n' +
+          'K1,x,10.003\n' +
+          'K2,x,20.004\n' +
+          'K3,y,5.000\n' +
+          'K4,,0.001',
+      },
+      remote: {
+        filename: 'remote.csv',
+        content:
+          'id,g,a\n' +
+          'K1,x,10.003\n' +
+          'K2,x,20.004\n' +
+          'K3,y,5.000\n' +
+          'K4,,0.001',
+      },
+    };
+    const allocRound = (await upload(ALLOC)).json().roundId;
+    assert.strictEqual(
+      (await jsonReq('/api/merge', { roundId: allocRound, keyColumn: 'id' })).status,
+      200,
+    );
+
+    await test('分摊：roundId 无效 → 404；尚未合并 → 400', async () => {
+      let r = await jsonReq('/api/allocation', {
+        roundId: 'nope',
+        decisions: {},
+        groupColumn: 'g',
+        amountColumn: 'a',
+      });
+      assert.strictEqual(r.status, 404);
+      assert.strictEqual(r.json().stage, 'round');
+      const fresh = (await upload(ALLOC)).json().roundId;
+      r = await jsonReq('/api/allocation', {
+        roundId: fresh,
+        decisions: {},
+        groupColumn: 'g',
+        amountColumn: 'a',
+      });
+      assert.strictEqual(r.status, 400);
+      assert.strictEqual(r.json().stage, 'request');
+    });
+
+    await test('分摊：参数非法 → 400（缺列 / 不在表头 / 两列相同）', async () => {
+      const bad = [
+        [{ groupColumn: '', amountColumn: 'a' }, '缺少 groupColumn'],
+        [{ groupColumn: 'g', amountColumn: '' }, '缺少 amountColumn'],
+        [{ groupColumn: 'nope', amountColumn: 'a' }, '不在表头'],
+        [{ groupColumn: 'g', amountColumn: 'nope' }, '不在表头'],
+        [{ groupColumn: 'g', amountColumn: 'g' }, '不同'],
+      ];
+      for (const [patch, msg] of bad) {
+        const r = await jsonReq('/api/allocation', {
+          roundId: allocRound,
+          decisions: {},
+          groupColumn: 'g',
+          amountColumn: 'a',
+          ...patch,
+        });
+        assert.strictEqual(r.status, 400, `${JSON.stringify(patch)} → ${r.text.slice(0, 120)}`);
+        assert.ok(r.json().errors[0].message.includes(msg), r.json().errors[0].message);
+      }
+    });
+
+    await test('分摊：原表头已有「分摊金额」列 → 400 明确报错（展示与导出均拒绝）', async () => {
+      const files = {
+        base: { filename: 'b.csv', content: 'id,g,分摊金额\nK1,x,1.0' },
+        local: { filename: 'l.csv', content: 'id,g,分摊金额\nK1,x,1.0' },
+        remote: { filename: 'r.csv', content: 'id,g,分摊金额\nK1,x,1.0' },
+      };
+      const rid = (await upload(files)).json().roundId;
+      assert.strictEqual((await jsonReq('/api/merge', { roundId: rid, keyColumn: 'id' })).status, 200);
+      for (const url of ['/api/allocation', '/api/allocation/export']) {
+        const r = await jsonReq(url, {
+          roundId: rid,
+          decisions: {},
+          groupColumn: 'g',
+          amountColumn: '分摊金额',
+        });
+        assert.strictEqual(r.status, 400, url);
+        assert.strictEqual(r.json().stage, 'request');
+        assert.ok(r.json().errors[0].message.includes('分摊金额'));
+        assert.strictEqual(r.json().errors[0].line, 1);
+      }
+    });
+
+    await test('分摊：有未决冲突 → 409（展示与导出），不给出结论', async () => {
+      for (const url of ['/api/allocation', '/api/allocation/export']) {
+        const r = await jsonReq(url, {
+          roundId, // SMALL 这一轮还有 K1 的单元格冲突未裁决
+          decisions: {},
+          groupColumn: 'city',
+          amountColumn: 'name',
+        });
+        assert.strictEqual(r.status, 409, url);
+        assert.strictEqual(r.json().stage, 'unresolved');
+        assert.strictEqual(r.json().allocation, undefined);
+      }
+    });
+
+    let allocResult = null;
+    await test('分摊：正常计算返回每组总额与逐行分摊额（余数降序、空串分组）', async () => {
+      const r = await jsonReq('/api/allocation', {
+        roundId: allocRound,
+        decisions: {},
+        groupColumn: 'g',
+        amountColumn: 'a',
+      });
+      assert.strictEqual(r.status, 200, r.text);
+      allocResult = r.json().allocation;
+      assert.strictEqual(allocResult.allocationColumn, '分摊金额');
+      assert.strictEqual(allocResult.rowCount, 4);
+      assert.strictEqual(allocResult.groupCount, 3);
+      assert.deepStrictEqual(
+        allocResult.groups.map((g) => g.groupValue),
+        ['x', 'y', ''],
+      );
+      const x = allocResult.groups[0];
+      assert.strictEqual(x.sumExact, '30.007');
+      assert.strictEqual(x.totalRounded, '30.01');
+      assert.strictEqual(x.floorTotal, '30.00');
+      assert.strictEqual(x.diffCents, 1);
+      assert.deepStrictEqual(
+        x.rows.map((row) => [row.key, row.line, row.allocated, row.extraCent]),
+        [
+          ['K1', 2, '10.00', false],
+          ['K2', 3, '20.01', true],
+        ],
+      );
+      // 空串自成一组：0.001 → 0.00，无尾差
+      const empty = allocResult.groups[2];
+      assert.strictEqual(empty.groupValue, '');
+      assert.strictEqual(empty.rows[0].key, 'K4');
+      assert.strictEqual(empty.totalRounded, '0.00');
+    });
+
+    await test('分摊：空值 / 非法金额 → 409 stage=amount，逐行指出最终 CSV 行号并拒绝整次计算', async () => {
+      const files = {
+        base: {
+          filename: 'b.csv',
+          content: 'id,g,a\nK1,x,1.00\nK2,x,\nK3,y,1e3\nK4,y,-2\nK5,y,1.23456',
+        },
+        local: {
+          filename: 'l.csv',
+          content: 'id,g,a\nK1,x,1.00\nK2,x,\nK3,y,1e3\nK4,y,-2\nK5,y,1.23456',
+        },
+        remote: {
+          filename: 'r.csv',
+          content: 'id,g,a\nK1,x,1.00\nK2,x,\nK3,y,1e3\nK4,y,-2\nK5,y,1.23456',
+        },
+      };
+      const rid = (await upload(files)).json().roundId;
+      assert.strictEqual((await jsonReq('/api/merge', { roundId: rid, keyColumn: 'id' })).status, 200);
+      const r = await jsonReq('/api/allocation', {
+        roundId: rid,
+        decisions: {},
+        groupColumn: 'g',
+        amountColumn: 'a',
+      });
+      assert.strictEqual(r.status, 409);
+      const data = r.json();
+      assert.strictEqual(data.stage, 'amount');
+      assert.strictEqual(data.errorCount, 4);
+      assert.strictEqual(data.allocation, undefined);
+      assert.deepStrictEqual(
+        data.errors.map((e) => e.line),
+        [3, 4, 5, 6],
+      );
+      assert.ok(data.errors[0].message.includes('第 3 行'));
+      assert.ok(data.errors[0].message.includes('为空'));
+      assert.ok(data.errors[1].message.includes('1e3'));
+      // 导出同样拒绝
+      const ex = await jsonReq('/api/allocation/export', {
+        roundId: rid,
+        decisions: {},
+        groupColumn: 'g',
+        amountColumn: 'a',
+      });
+      assert.strictEqual(ex.status, 409);
+      assert.strictEqual(ex.json().stage, 'amount');
+    });
+
+    await test('分摊：只按服务端本轮模型与裁决取数，无视浏览器夹带的行值', async () => {
+      const r = await jsonReq('/api/allocation', {
+        roundId: allocRound,
+        decisions: {},
+        groupColumn: 'g',
+        amountColumn: 'a',
+        rows: [['HACK', 'z', '999.99']],
+        model: { headers: ['a'] },
+        allocation: { groups: [] },
+      });
+      assert.strictEqual(r.status, 200, r.text);
+      assert.deepStrictEqual(
+        r.json().allocation.groups.map((g) => g.groupValue),
+        allocResult.groups.map((g) => g.groupValue),
+      );
+      assert.ok(!JSON.stringify(r.json().allocation).includes('HACK'));
+    });
+
+    await test('分摊：导出追加列 CSV（BOM、原行序、分摊额与展示一致）；原合并 CSV 不变', async () => {
+      const r = await jsonReq('/api/allocation/export', {
+        roundId: allocRound,
+        decisions: {},
+        groupColumn: 'g',
+        amountColumn: 'a',
+      });
+      assert.strictEqual(r.status, 200, r.text);
+      assert.ok(r.headers['content-type'].includes('text/csv'));
+      assert.ok(r.text.charCodeAt(0) === 0xfeff, '导出带 UTF-8 BOM');
+      assert.ok(r.headers['content-disposition'].includes('allocation.csv'));
+      const lines = r.text.replace(/^﻿/, '').split(/\r?\n/).filter(Boolean);
+      assert.deepStrictEqual(lines, [
+        'id,g,a,分摊金额',
+        'K1,x,10.003,10.00',
+        'K2,x,20.004,20.01',
+        'K3,y,5.000,5.00',
+        'K4,,0.001,0.00',
+      ]);
+      // 原合并 CSV 导出不受任何影响（无追加列）
+      const merged = await jsonReq('/api/export', { roundId: allocRound, decisions: {} });
+      assert.strictEqual(merged.status, 200, merged.text);
+      const mergedLines = merged.text.replace(/^﻿/, '').split(/\r?\n/).filter(Boolean);
+      assert.strictEqual(mergedLines[0], 'id,g,a');
+      assert.strictEqual(mergedLines.length, 5);
+    });
+
+    await test('分摊：无保留行时导出只含新表头一行', async () => {
+      const files = {
+        base: { filename: 'b.csv', content: 'id,g,a\nK1,x,1' },
+        local: { filename: 'l.csv', content: 'id,g,a' },
+        remote: { filename: 'r.csv', content: 'id,g,a' },
+      };
+      const rid = (await upload(files)).json().roundId;
+      assert.strictEqual((await jsonReq('/api/merge', { roundId: rid, keyColumn: 'id' })).status, 200);
+      const view = await jsonReq('/api/allocation', {
+        roundId: rid,
+        decisions: {},
+        groupColumn: 'g',
+        amountColumn: 'a',
+      });
+      assert.strictEqual(view.status, 200, view.text);
+      assert.strictEqual(view.json().allocation.rowCount, 0);
+      assert.deepStrictEqual(view.json().allocation.groups, []);
+      const ex = await jsonReq('/api/allocation/export', {
+        roundId: rid,
+        decisions: {},
+        groupColumn: 'g',
+        amountColumn: 'a',
+      });
+      assert.strictEqual(ex.status, 200, ex.text);
+      const lines = ex.text.replace(/^﻿/, '').split(/\r?\n/).filter(Boolean);
+      assert.deepStrictEqual(lines, ['id,g,a,分摊金额']);
+    });
+
     // ---------- 标识无效 / 过期 / 串轮 ----------
     await test('合并使用不存在的 roundId → 404 且明确提示重新上传', async () => {
       const r = await jsonReq('/api/merge', { roundId: 'deadbeef'.repeat(8), keyColumn: 'id' });
