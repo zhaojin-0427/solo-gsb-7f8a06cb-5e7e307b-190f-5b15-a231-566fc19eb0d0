@@ -13,6 +13,7 @@ const { buildImportOrder } = require('./src/order');
 const { buildPlan, validatePlanStructure, applyPlan, cloneDecisions } = require('./src/plan');
 const { buildKeyChangeCheck, validateKeyCheckParams } = require('./src/keychange');
 const { buildDeterminants, validateDeterminantParams } = require('./src/determinants');
+const { buildAllocation, validateAllocationParams } = require('./src/allocation');
 const { RoundStore } = require('./src/rounds');
 
 const app = express();
@@ -691,6 +692,116 @@ app.post('/api/determinants', (req, res) => {
     }
 
     res.json({ ok: true, roundId, result: result.result });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({
+      ok: false,
+      stage: 'server',
+      errors: [{ file: null, line: null, message: err.message }],
+    });
+  }
+});
+
+/**
+ * POST /api/allocation
+ * body: { roundId, decisions, groupColumn, amountColumn }
+ * 合并金额尾差分摊：冲突全部裁决后，从本轮模型与当前裁决取得最终保留行，
+ * 按分组列原字符串分组（空串也成组），各组精确求和后四舍五入到分，
+ * 每行先向下取整到分，再将差额按不足一分的余数降序、同余数按最终行序逐分分配。
+ * 金额只接受非负、无指数、最多四位小数的十进制字符串；空值 / 非法值逐行指出
+ * 最终 CSV 行号并返回 409（stage=amount）拒绝整次计算；原表头已有"分摊金额"
+ * 同名列或选列非法返回 400；有未决冲突返回 409（stage=unresolved）。
+ * 只读：不改动模型、数据、裁决与原合并 CSV。
+ */
+app.post('/api/allocation', (req, res) => {
+  try {
+    const { roundId, decisions, groupColumn, amountColumn } = req.body || {};
+    const round = roundStore.get(roundId);
+    if (!round) return roundNotFound(res);
+    const { model } = round;
+    if (!requireModel(res, model)) return;
+
+    const paramError = validateAllocationParams(model, groupColumn, amountColumn);
+    if (paramError) {
+      return res.status(400).json({
+        ok: false,
+        stage: 'request',
+        errors: [{ file: null, line: null, message: paramError }],
+      });
+    }
+
+    const result = buildAllocation(model, normalizeDecisions(decisions), groupColumn, amountColumn);
+    if (result.unresolved > 0) return unresolvedResponse(res, result);
+
+    if (result.valueErrors) {
+      return res.status(409).json({
+        ok: false,
+        stage: 'amount',
+        errorCount: result.valueErrors.length,
+        errors: result.valueErrors.map((e) => ({
+          file: null,
+          line: e.line,
+          message: e.message,
+        })),
+      });
+    }
+
+    res.json({ ok: true, roundId, allocation: result.allocation });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({
+      ok: false,
+      stage: 'server',
+      errors: [{ file: null, line: null, message: err.message }],
+    });
+  }
+});
+
+/**
+ * POST /api/allocation/export
+ * body: { roundId, decisions, groupColumn, amountColumn }
+ * 分摊 CSV 下载：校验 / 计算与 /api/allocation 完全一致——非法金额、未决冲突
+ * 同样拒绝；合法时在原合并 CSV（基准表头、原行序、原单元格值）末尾追加
+ * "分摊金额"列返回 allocated.csv。原表头已有同名列时返回 400 明确报错；
+ * 无保留行时文件只含追加后的新表头。原有 /api/export 合并 CSV 不受任何影响。
+ */
+app.post('/api/allocation/export', (req, res) => {
+  try {
+    const { roundId, decisions, groupColumn, amountColumn } = req.body || {};
+    const round = roundStore.get(roundId);
+    if (!round) return roundNotFound(res);
+    const { model } = round;
+    if (!requireModel(res, model)) return;
+
+    const paramError = validateAllocationParams(model, groupColumn, amountColumn);
+    if (paramError) {
+      return res.status(400).json({
+        ok: false,
+        stage: 'request',
+        errors: [{ file: null, line: null, message: paramError }],
+      });
+    }
+
+    const result = buildAllocation(model, normalizeDecisions(decisions), groupColumn, amountColumn);
+    if (result.unresolved > 0) return unresolvedResponse(res, result);
+
+    if (result.valueErrors) {
+      return res.status(409).json({
+        ok: false,
+        stage: 'amount',
+        errorCount: result.valueErrors.length,
+        errors: result.valueErrors.map((e) => ({
+          file: null,
+          line: e.line,
+          message: e.message,
+        })),
+      });
+    }
+
+    const csv = String.fromCharCode(0xfeff) + stringifyCSV(result.rows);
+    res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+    res.setHeader('Content-Disposition', 'attachment; filename="allocated.csv"');
+    res.send(csv);
   } catch (err) {
     console.error(err);
     res.status(500).json({

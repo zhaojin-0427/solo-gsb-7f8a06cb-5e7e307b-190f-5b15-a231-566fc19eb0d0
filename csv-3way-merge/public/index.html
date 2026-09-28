@@ -393,6 +393,67 @@
         <p class="det-disclaimer" id="det-disclaimer"></p>
       </div>
     </section>
+
+    <!-- 第九步：合并金额尾差分摊 -->
+    <section id="step-allocation" class="card hidden">
+      <h2><span class="step-no">9</span> 合并金额尾差分摊</h2>
+      <p class="ledger-intro">
+        冲突全部裁决后，选择<b>互异的分组列与金额列</b>（分组列可含空串，空串也成组）。
+        金额以<b>元</b>计，只接受<b>非负、无指数、最多四位小数</b>的十进制字符串；
+        空值或非法值会指出<b>最终 CSV 行号</b>并<b>拒绝整次计算</b>。
+        服务端按本轮模型与当前裁决取得最终保留行，按分组列<b>原字符串</b>分组，
+        各组<b>精确求和</b>后<b>四舍五入到分</b>，每行先<b>向下取整到分</b>，
+        再把差额按<b>原金额不足一分的余数降序</b>、同余数按<b>最终行序</b>逐分分配。
+        页面展示每组总额与逐行分摊额；可下载按<b>原行序</b>追加<b>分摊金额</b>列的 CSV
+        （原表头已有同名列时明确报错，无行时只输出新表头）。
+        裁决或选列变化后自动重算；不改变数据、裁决与原合并 CSV 导出。
+      </p>
+
+      <div class="toolbar">
+        <div class="keycheck-controls">
+          <div class="key-row">
+            <label for="alloc-group-select">分组列：</label>
+            <select id="alloc-group-select"></select>
+          </div>
+          <div class="key-row">
+            <label for="alloc-amount-select">金额列：</label>
+            <select id="alloc-amount-select"></select>
+          </div>
+        </div>
+        <div class="export-area">
+          <button id="btn-allocation" class="primary" disabled>下载分摊 CSV</button>
+        </div>
+      </div>
+
+      <div id="alloc-hint" class="hierarchy-hint hidden">
+        请选择互异的分组列与金额列后开始分摊。
+      </div>
+      <div id="alloc-pending" class="ledger-pending hidden">
+        还有未解决的冲突：全部裁决完成后才会进行合并金额尾差分摊。
+      </div>
+      <div id="alloc-header-error" class="ledger-pending hidden"></div>
+      <div id="alloc-nodata" class="ledger-pending hidden">
+        当前没有最终保留行（数据为空或全部被删除）：分摊 CSV 将只输出追加「分摊金额」列后的新表头。
+      </div>
+      <div id="alloc-errors" class="errors hidden"></div>
+
+      <div id="alloc-content" class="hidden">
+        <div id="alloc-summary" class="ledger-summary"></div>
+        <p class="plan-note" id="alloc-rule-note"></p>
+        <div class="table-wrap">
+          <table id="alloc-table">
+            <thead>
+              <tr>
+                <th>分组（原字符串）</th><th>最终行号</th><th>唯一键</th>
+                <th>原金额（元）</th><th>向下取整（元）</th><th>不足一分余数（分）</th>
+                <th>尾差多分</th><th>分摊金额（元）</th>
+              </tr>
+            </thead>
+            <tbody id="alloc-tbody"></tbody>
+          </table>
+        </div>
+      </div>
+    </section>
   </main>
 
   <footer>

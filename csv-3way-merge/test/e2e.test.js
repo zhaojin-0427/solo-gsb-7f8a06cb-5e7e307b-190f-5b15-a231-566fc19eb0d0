@@ -17,6 +17,13 @@ const {
   validateDeterminantParams,
   buildDeterminants,
 } = require('../src/determinants');
+const {
+  APPENDED_HEADER,
+  parseAmountUnits,
+  formatCents,
+  validateAllocationParams,
+  buildAllocation,
+} = require('../src/allocation');
 
 let passed = 0;
 function test(name, fn) {
@@ -1435,6 +1442,178 @@ test('发现：最终行序与逐格取值和导出一致（读裁决后的最�
   const ce = out.result.counterexample;
   assert.strictEqual(ce.row1.key, 'K1');
   assert.strictEqual(ce.row2.key, 'K2');
+});
+
+// ---------- 合并金额尾差分摊 ----------
+test('分摊：金额字符串白名单（非负 / 无指数 / 最多四位小数）', () => {
+  for (const s of ['0', '1', '100', '1.2', '0.0001', '123.4567', '1.5000']) {
+    assert.notStrictEqual(parseAmountUnits(s), null, s);
+  }
+  for (const s of [
+    '',
+    ' ',
+    ' 1',
+    '1 ',
+    '-1',
+    '+1',
+    '1e3',
+    '1E2',
+    '.5',
+    '1.',
+    '01',
+    '00',
+    '1.23456',
+    '1.2.3',
+    'NaN',
+    'Infinity',
+    '１',
+    '1,234',
+  ]) {
+    assert.strictEqual(parseAmountUnits(s), null, `应拒绝 ${JSON.stringify(s)}`);
+  }
+});
+
+test('分摊：精确求和四舍五入到分，差额按余数降序 / 并列按行序逐分分配', () => {
+  // A：1.005 + 2.006 = 3.011 → 3.01；floor 合计 3.00 → D=1；余数 50<60 → 键2 +1 分
+  // 空串组：0.009 + 0.001 = 0.010 → 0.01；D=1；余数 90>10 → 键3 +1 分
+  // C：0.004 + 0.004 = 0.008 → 0.01；D=1；余数并列 → 行序靠前的键5 +1 分
+  // D：0 → 0.00；D=0
+  const csv =
+    'id,g,a\n1,A,1.005\n2,A,2.006\n3,,0.009\n4,,0.001\n5,C,0.004\n6,C,0.004\n7,D,0';
+  const p = parse3(csv, csv, csv);
+  const m = buildMerge(p, 'id');
+  const out = buildAllocation(m, {}, 'g', 'a');
+  assert.strictEqual(out.unresolved, 0);
+  assert.strictEqual(out.valueErrors, undefined);
+  const a = out.allocation;
+  assert.strictEqual(a.rowCount, 7);
+  assert.strictEqual(a.noData, false);
+  assert.strictEqual(a.appendedHeader, APPENDED_HEADER);
+  assert.deepStrictEqual(
+    a.groups.map((g) => [g.groupValue, g.exactTotalText, g.roundedTotalText, g.differenceCents]),
+    [
+      ['A', '3.011', '3.01', 1],
+      ['', '0.01', '0.01', 1],
+      ['C', '0.008', '0.01', 1],
+      ['D', '0', '0.00', 0],
+    ],
+  );
+  const byKey = new Map();
+  for (const g of a.groups) for (const r of g.rows) byKey.set(r.key, r);
+  assert.strictEqual(byKey.get('1').allocatedText, '1.00');
+  assert.strictEqual(byKey.get('1').gotDifference, false);
+  assert.strictEqual(byKey.get('2').allocatedText, '2.01');
+  assert.strictEqual(byKey.get('2').gotDifference, true);
+  assert.deepStrictEqual(a.groups[0].allocationOrder, [3]); // 最终 CSV 行号
+  assert.strictEqual(byKey.get('3').allocatedText, '0.01');
+  assert.strictEqual(byKey.get('4').allocatedText, '0.00');
+  assert.strictEqual(byKey.get('5').allocatedText, '0.01'); // 并列余数：行序优先
+  assert.strictEqual(byKey.get('6').allocatedText, '0.00');
+  assert.strictEqual(byKey.get('7').allocatedText, '0.00');
+
+  // 守恒：每组各行分摊额之和（分）精确等于组总额四舍五入到分
+  for (const g of a.groups) {
+    const sum = g.rows.reduce(
+      (acc, r) => acc + BigInt(Math.round(Number(r.allocatedText) * 100)),
+      0n,
+    );
+    assert.strictEqual(formatCents(sum), g.roundedTotalText, g.groupValue);
+  }
+
+  // 导出：原行序、原值，末尾追加"分摊金额"列
+  assert.deepStrictEqual(out.rows[0], ['id', 'g', 'a', '分摊金额']);
+  assert.deepStrictEqual(out.rows[1], ['1', 'A', '1.005', '1.00']);
+  assert.deepStrictEqual(out.rows[2], ['2', 'A', '2.006', '2.01']);
+  assert.deepStrictEqual(out.rows[3], ['3', '', '0.009', '0.01']);
+  assert.strictEqual(out.rows.length, 8); // 表头 + 7 行
+});
+
+test('分摊：大额与多位小数精确（不走浮点），四舍五入半值向上', () => {
+  // 99999999999.9999 + 0.0001 = 100000000000.0000 → 100000000000.00
+  // 0.005 单行：floor 0.00，余数 50 → 半值向上 +1 分 → 0.01
+  const csv = 'id,g,a\n1,A,99999999999.9999\n2,A,0.0001\n3,B,0.005';
+  const p = parse3(csv, csv, csv);
+  const out = buildAllocation(buildMerge(p, 'id'), {}, 'g', 'a');
+  assert.strictEqual(out.unresolved, 0);
+  const gA = out.allocation.groups.find((g) => g.groupValue === 'A');
+  assert.strictEqual(gA.exactTotalText, '100000000000');
+  assert.strictEqual(gA.roundedTotalText, '100000000000.00');
+  assert.strictEqual(gA.differenceCents, 1);
+  const gB = out.allocation.groups.find((g) => g.groupValue === 'B');
+  assert.strictEqual(gB.rows[0].allocatedText, '0.01');
+});
+
+test('分摊：非法 / 空金额逐行指出最终 CSV 行号并拒绝整次计算', () => {
+  const csv = 'id,g,a\n1,A,1.00\n2,A,\n3,A,1e3\n4,A,1.23456';
+  const p = parse3(csv, csv, csv);
+  const out = buildAllocation(buildMerge(p, 'id'), {}, 'g', 'a');
+  assert.strictEqual(out.allocation, undefined);
+  assert.ok(out.valueErrors && out.valueErrors.length === 3);
+  assert.deepStrictEqual(out.valueErrors.map((e) => e.line), [3, 4, 5]); // 最终 CSV 行号
+  assert.strictEqual(out.valueErrors[0].key, '2');
+  assert.strictEqual(out.valueErrors[0].line, 3);
+  assert.ok(out.valueErrors[1].message.includes('1e3'));
+});
+
+test('分摊：未决冲突 → 不给结论', () => {
+  // 单元格冲突未裁决
+  const p = parse3(
+    'id,g,a\nK1,A,0.01\nK2,B,0.02',
+    'id,g,a\nK1,A,0.03\nK2,B,0.02',
+    'id,g,a\nK1,A,0.04\nK2,B,0.02',
+  );
+  const out = buildAllocation(buildMerge(p, 'id'), {}, 'g', 'a');
+  assert.ok(out.unresolved > 0);
+  assert.strictEqual(out.allocation, undefined);
+  assert.strictEqual(out.rows, undefined);
+});
+
+test('分摊：最终保留行含删除键时只按最终行编号；裁决改变后结果重算', () => {
+  // D 两侧自动删除；K1 是单元格冲突（基准 bad，本地 bad2，远端 0.05）——未裁决时
+  // unresolved；裁决手填非法值 bad 时按最终 CSV 第 2 行报错；手填合法值后重算通过
+  const p = parse3(
+    'id,g,a\nK1,A,bad\nK2,A,0.02\nD,X,1',
+    'id,g,a\nK1,A,bad2\nK2,A,0.02',
+    'id,g,a\nK1,A,0.05\nK2,A,0.02',
+  );
+  const m = buildMerge(p, 'id');
+  let out = buildAllocation(m, {}, 'g', 'a');
+  assert.ok(out.unresolved > 0, '未裁决 K1 单元格冲突 → unresolved');
+  out = buildAllocation(m, { cells: { K1: { 2: { choice: 'manual', value: 'bad' } } } }, 'g', 'a');
+  assert.deepStrictEqual(out.valueErrors.map((e) => [e.key, e.line]), [['K1', 2]]);
+  // 手填合法值后重算：只剩 K1/K2 同组，0.05 + 0.02 = 0.07
+  out = buildAllocation(m, { cells: { K1: { 2: { choice: 'manual', value: '0.05' } } } }, 'g', 'a');
+  assert.strictEqual(out.valueErrors, undefined);
+  assert.strictEqual(out.allocation.rowCount, 2);
+  assert.strictEqual(out.allocation.groups[0].roundedTotalText, '0.07');
+  assert.deepStrictEqual(out.rows.map((r) => r[0]), ['id', 'K1', 'K2']);
+});
+
+test('分摊：无保留行 → noData，导出仅新表头', () => {
+  const p = parse3('id,g,a\nD,X,1', 'id,g,a', 'id,g,a');
+  const out = buildAllocation(buildMerge(p, 'id'), {}, 'g', 'a');
+  assert.strictEqual(out.allocation.noData, true);
+  assert.strictEqual(out.allocation.rowCount, 0);
+  assert.deepStrictEqual(out.allocation.groups, []);
+  assert.deepStrictEqual(out.rows, [['id', 'g', 'a', '分摊金额']]);
+});
+
+test('分摊：参数校验（缺列 / 不在表头 / 不互异 / 追加列撞名）', () => {
+  const p = parse3('id,g,a,分摊金额\n1,A,0.1,x', 'id,g,a,分摊金额\n1,A,0.1,x', 'id,g,a,分摊金额\n1,A,0.1,x');
+  const m = buildMerge(p, 'id');
+  assert.ok(validateAllocationParams(m, '', 'a'));
+  assert.ok(validateAllocationParams(m, 'g', ''));
+  assert.ok(validateAllocationParams(m, 'nope', 'a'));
+  assert.ok(validateAllocationParams(m, 'g', 'nope'));
+  assert.ok(validateAllocationParams(m, 'g', 'g'));
+  // 原表头已有同名列 → 明确报错
+  const clash = validateAllocationParams(m, 'g', 'a');
+  assert.ok(clash.includes('分摊金额'));
+  // 正常表头不撞名
+  const p2 = parse3('id,g,a\n1,A,0.1', 'id,g,a\n1,A,0.1', 'id,g,a\n1,A,0.1');
+  assert.strictEqual(validateAllocationParams(buildMerge(p2, 'id'), 'g', 'a'), null);
+  // 分组列允许是唯一键列
+  assert.strictEqual(validateAllocationParams(buildMerge(p2, 'id'), 'id', 'a'), null);
 });
 
 console.log(`\n全部 ${passed} 个测试通过`);
